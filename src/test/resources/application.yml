@@ -48,3 +48,8 @@ kestra:
         values:
           allowed-paths:
             - /tmp
+      - type: io.kestra.plugin.fs.local.RealtimeTrigger
+        values:
+          allowed-paths:
+            - /tmp
+            - "C:\\Users"  # Allow temp directories on Windows (system temp folder)
