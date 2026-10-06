@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
@@ -48,58 +49,62 @@ class RealtimeTriggerTest {
         Path testFile = tempDir.resolve("test.txt");
 
         try {
-            // Create the realtime trigger
+            // Create the realtime trigger with DEFAULT event type (CREATE_OR_UPDATE)
+            // This tests that the default behavior is CREATE_OR_UPDATE, not just CREATE
             RealtimeTrigger trigger = RealtimeTrigger.builder()
-                .id("test-realtime")
+                .id("test-realtime-default")
                 .type(RealtimeTrigger.class.getName())
                 .from(Property.ofValue(tempDir.toString()))
-                .on(Property.ofValue(RealtimeTrigger.EventType.CREATE))
+                // .on() is NOT specified - defaults to CREATE_OR_UPDATE
                 .build();
 
             // Mock the trigger context
             var context = TestsUtils.mockTrigger(runContextFactory, trigger);
 
-            // Start the watcher on a background thread using boundedElastic scheduler
-            // This prevents the test thread from being blocked by service.take()
+            // Capture the execution
+            Execution[] receivedExecution = new Execution[1];
             Thread watcherThread = new Thread(() -> {
                 try {
-                    Execution execution = Flux.from(
+                    receivedExecution[0] = Flux.from(
                             trigger.evaluate(context.getKey(), context.getValue())
                         )
                         .subscribeOn(Schedulers.boundedElastic())
                         .blockFirst(Duration.ofSeconds(10));
-
-                    if (execution != null) {
-                        System.out.println("✓ Received execution: " + execution.getId());
-                    }
                 } catch (Exception e) {
                     System.err.println("✗ Watcher error: " + e.getMessage());
                     e.printStackTrace();
                 }
             });
 
-            watcherThread.setName("RealtimeTrigger-Watcher");
+            watcherThread.setName("RealtimeTrigger-Default-Event-Test");
             watcherThread.start();
 
             // Wait for watcher to initialize with deterministic polling
-            System.out.println("✓ Watcher initializing...");
             waitForWatcherReady(trigger, 5);
-            System.out.println("✓ Watcher ready, creating test file");
 
-            // Create a test file - this should be detected by the watcher
+            // Create a test file - should trigger with default behavior
             Files.write(testFile, "test content".getBytes());
-            System.out.println("✓ Test file created: " + testFile);
 
             // Wait for watcher thread to complete (with timeout)
             watcherThread.join(12000);
 
             if (watcherThread.isAlive()) {
-                System.err.println("✗ Watcher thread still running, stopping trigger");
                 trigger.stop();
                 watcherThread.join(2000);
             }
 
-            System.out.println("✓ Watcher thread completed");
+            // Verify execution was received
+            assertThat("Should have received execution when creating a file with default event type",
+                receivedExecution[0], notNullValue());
+
+            // Verify changeType is CREATE (default on() includes CREATE)
+            Map<String, Object> variables = receivedExecution[0].getTrigger().getVariables();
+            assertThat("changeType should be CREATE for newly created file",
+                variables.get("changeType"), equalTo("CREATE"));
+
+            System.out.println("\n✓ Default Event Type (CREATE_OR_UPDATE) Test Passed:");
+            System.out.println("  Default on() includes CREATE");
+            System.out.println("  File creation triggers execution with CREATE changeType");
 
         } finally {
             // Cleanup
@@ -461,13 +466,16 @@ class RealtimeTriggerTest {
             // Mock the trigger context
             var context = TestsUtils.mockTrigger(runContextFactory, trigger);
 
+            // Capture any exception from the watcher thread
+            Throwable[] watcherException = new Throwable[1];
             Thread watcherThread = new Thread(() -> {
                 try {
                     Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
                         .subscribeOn(Schedulers.boundedElastic())
                         .blockFirst(Duration.ofSeconds(10));
                 } catch (Exception e) {
-                    // Expected when trigger is stopped
+                    // Store the exception - it's expected when trigger is stopped, but we want to verify
+                    watcherException[0] = e;
                 }
             });
 
@@ -490,10 +498,25 @@ class RealtimeTriggerTest {
             assertThat("Watcher thread should have completed", 
                 watcherThread.isAlive(), is(false));
 
+            // Verify cleanup: watcher should no longer be ready
+            assertThat("Watcher should not be ready after stop", trigger.isReady(), is(false));
+
+            // Verify no unexpected exceptions occurred
+            if (watcherException[0] != null && !(watcherException[0] instanceof CancellationException)) {
+                if (watcherException[0] instanceof RuntimeException) {
+                    throw (RuntimeException) watcherException[0];
+                } else if (watcherException[0] instanceof Exception) {
+                    throw (Exception) watcherException[0];
+                } else {
+                    throw new RuntimeException("Unexpected exception in watcher thread", watcherException[0]);
+                }
+            }
+
             System.out.println("\n✓ Stop and Cleanup Test Passed:");
             System.out.println("  Trigger stopped cleanly");
             System.out.println("  Watcher thread terminated");
-            System.out.println("  Resources cleaned up");
+            System.out.println("  Resources cleaned up (watchKeyMap cleared)");
+
 
         } finally {
             // Cleanup

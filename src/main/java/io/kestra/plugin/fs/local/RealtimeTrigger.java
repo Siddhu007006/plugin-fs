@@ -307,12 +307,16 @@ public class RealtimeTrigger extends AbstractTrigger
 
                             Path eventPath = directory.resolve((Path) event.context());
 
-                            if (kind == StandardWatchEventKinds.ENTRY_CREATE && rRecursive && Files.isDirectory(eventPath)) {
+                            if (kind == StandardWatchEventKinds.ENTRY_CREATE && rRecursive && Files.isDirectory(eventPath) && !Files.isSymbolicLink(eventPath)) {
                                 try {
+                                    // Security: We reject symlinks above (the actual attack vector).
+                                    // Non-symlink directories created dynamically inherit allowed-paths
+                                    // from their parent, so we don't need to re-validate them.
                                     registerDirectory(eventPath);
                                     registerDirectoryTree(eventPath);
                                 } catch (IOException e) {
                                     // Could not register newly created directory (may have been deleted)
+                                    logger.debug("Could not register dynamically created directory {}: {}", eventPath, e.getMessage());
                                 }
                                 continue;
                             }
