@@ -1,0 +1,60 @@
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "id": 1,
+      "severity": "P0",
+      "title": "Symlinked file paths not validated before emission",
+      "description": "File events are not validated against allowed-paths before emitEventExecution(). Symlinked files in the watched directory can emit events without validation. Only dynamically registered subdirectories are validated. Requires validatePath() call before emitEventExecution() for all event types."
+    },
+    {
+      "id": 2,
+      "severity": "P0",
+      "title": "Shared mutable runtime state via instance fields",
+      "description": "watchKeyMap and registeredDirectories are instance fields reassigned on each evaluate() call (lines 216–217). Concurrent subscriptions to the same trigger instance will share and interfere via these fields. Requires making them local variables scoped to the Flux.create() lambda."
+    },
+    {
+      "id": 3,
+      "severity": "P0",
+      "title": "Event loop can block indefinitely on empty watchKeyMap",
+      "description": "When all WatchKeys become invalid and watchKeyMap is cleared, the next service.take() call blocks indefinitely with no new events arriving. Requires checking if map is empty after removal and breaking the loop, or terminating the watcher."
+    },
+    {
+      "id": 4,
+      "severity": "P0",
+      "title": "Race between registerDirectory() and stop()",
+      "description": "registerDirectory() (lines 440–453) obtains a WatchKey and puts it in the map without checking if the trigger has stopped. A stop() can occur after the key is obtained but before it's added to the map. Requires checking active flag after obtaining the key and cancelling the key if false."
+    },
+    {
+      "id": 5,
+      "severity": "P0",
+      "title": "Incomplete cleanup on shutdown",
+      "description": "The cleanup path (lines 513–524) clears watchKeyMap but not registeredDirectories. Requires calling registeredDirectories.clear() alongside watchKeyMap.clear()."
+    },
+    {
+      "id": 6,
+      "severity": "P1",
+      "title": "String literal instead of ALLOWED_PATHS constant",
+      "description": "Uses string literal 'allowed-paths' instead of AbstractLocalTask.ALLOWED_PATHS constant in getAllowedPaths()."
+    },
+    {
+      "id": 7,
+      "severity": "P1",
+      "title": "isReady() does not check active flag",
+      "description": "isReady() does not check the active flag, allowing it to report true after stop() has been called."
+    },
+    {
+      "id": 8,
+      "severity": "P1",
+      "title": "Output.changeType not typed as enum",
+      "description": "Output.changeType is typed as String instead of a ChangeType enum. Would require creating the enum or reusing EventType."
+    },
+    {
+      "id": 9,
+      "severity": "P1",
+      "title": "Incorrect schema description for regExp",
+      "description": "Schema description for regExp says 'file names' instead of 'full path'."
+    }
+  ],
+  "reviewDoc": "c:\\Users\\Siddharth Reddy\\projects\\plugin-fs\\.agents\\tasks\\review.md"
+}

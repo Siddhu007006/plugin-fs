@@ -124,6 +124,15 @@ public class RealtimeTrigger extends AbstractTrigger
         DELETE
     }
 
+    /**
+     * Represents the type of filesystem change that occurred.
+     */
+    public enum ChangeType {
+        CREATE,
+        UPDATE,
+        DELETE
+    }
+
     @Schema(title = "Directory to watch")
     @NotNull
     @PluginProperty(group = "main")
@@ -134,7 +143,7 @@ public class RealtimeTrigger extends AbstractTrigger
     @PluginProperty(group = "advanced")
     private Property<Boolean> recursive = Property.ofValue(false);
 
-    @Schema(title = "Regex pattern to match file names")
+    @Schema(title = "Regex pattern to match against the full file path")
     @PluginProperty(group = "advanced")
     private Property<String> regExp;
 
@@ -145,17 +154,16 @@ public class RealtimeTrigger extends AbstractTrigger
 
     // Runtime state fields
     private transient final AtomicBoolean active = new AtomicBoolean(false);
+    private transient final AtomicBoolean ready = new AtomicBoolean(false);
     private transient final AtomicReference<WatchService> watchService = new AtomicReference<>();
     private transient Logger logger;
-    private transient Map<WatchKey, Path> watchKeyMap;
-    private transient Set<Path> registeredDirectories;  // Track directories to suppress DELETE events
 
     /**
      * Package-private readiness check for testing.
-     * Returns true when the trigger has initialized and is ready to watch for events.
+     * Returns true when the trigger is active and has successfully initialized the watcher.
      */
     boolean isReady() {
-        return watchKeyMap != null && !watchKeyMap.isEmpty();
+        return active.get() && ready.get();
     }
 
     /**
@@ -164,7 +172,7 @@ public class RealtimeTrigger extends AbstractTrigger
      * Throws SecurityException if not configured (required for all environments).
      */
     private List<String> getAllowedPaths(RunContext runContext) {
-        Optional<List<String>> allowedPathConfig = runContext.pluginConfiguration("allowed-paths");
+        Optional<List<String>> allowedPathConfig = runContext.pluginConfiguration(AbstractLocalTask.ALLOWED_PATHS);
 
         if (allowedPathConfig.isEmpty() || allowedPathConfig.get().isEmpty()) {
             throw new SecurityException(
@@ -228,8 +236,9 @@ public class RealtimeTrigger extends AbstractTrigger
         return Flux.<Execution>create(emitter -> {
             try {
                 active.set(true);
-                watchKeyMap = new ConcurrentHashMap<>();
-                registeredDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
+                // watchKeyMap and registeredDirectories are now local variables (subscription-local, not instance state)
+                Map<WatchKey, Path> watchKeyMap = new ConcurrentHashMap<>();
+                Set<Path> registeredDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
                 // Step 1: Render and validate the `from` property
                 String renderedFrom = runContext.render(this.from).as(String.class)
@@ -280,17 +289,19 @@ public class RealtimeTrigger extends AbstractTrigger
                 }
 
                 // Step 6: Register root directory
-                registerDirectory(rootDirectory);
+                registerDirectory(rootDirectory, watchKeyMap, registeredDirectories);
+                ready.set(true);
 
                 // If recursive, walk and register all subdirectories
                 boolean rRecursive = runContext.render(this.recursive).as(Boolean.class).orElse(false);
                 if (rRecursive) {
-                    registerDirectoryTree(rootDirectory);
+                    registerDirectoryTree(rootDirectory, watchKeyMap, registeredDirectories);
                 }
 
                 // Check cancellation before entering event loop
                 if (!active.get()) {
                     closeWatchService();
+                    cleanup(watchKeyMap, registeredDirectories);
                     return;
                 }
 
@@ -343,8 +354,8 @@ public class RealtimeTrigger extends AbstractTrigger
                                     // Dynamically created directories must be explicitly validated against
                                     // allowed-paths to enforce consistent security policy.
                                     validatePath(eventPath, runContext);
-                                    registerDirectory(eventPath);
-                                    registerDirectoryTree(eventPath);
+                                    registerDirectory(eventPath, watchKeyMap, registeredDirectories);
+                                    registerDirectoryTree(eventPath, watchKeyMap, registeredDirectories);
                                 } catch (SecurityException e) {
                                     // A newly created directory is outside allowed-paths. Skip it and continue watching.
                                     logger.warn("Security: Rejecting dynamically created directory outside allowed-paths: {} - {}",
@@ -364,19 +375,28 @@ public class RealtimeTrigger extends AbstractTrigger
                                 continue;
                             }
 
+                            // Security: Validate event path against allowed-paths before emission
+                            try {
+                                validatePath(eventPath, runContext);
+                            } catch (SecurityException | IOException e) {
+                                logger.warn("Security: Rejecting event for path outside allowed-paths: {} - {}",
+                                    eventPath, e.getMessage());
+                                continue;
+                            }
+
                             // Process event based on type
-                            String changeType = null;
+                            ChangeType changeType = null;
                             if (kind == StandardWatchEventKinds.ENTRY_CREATE) {
-                                changeType = "CREATE";
+                                changeType = ChangeType.CREATE;
                             } else if (kind == StandardWatchEventKinds.ENTRY_MODIFY) {
-                                changeType = "UPDATE";
+                                changeType = ChangeType.UPDATE;
                             } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
-                                changeType = "DELETE";
+                                changeType = ChangeType.DELETE;
                             }
 
                             if (changeType != null) {
                                 // Skip DELETE events for registered directories (file-only trigger)
-                                if ("DELETE".equals(changeType) && registeredDirectories.contains(eventPath.toAbsolutePath())) {
+                                if (changeType == ChangeType.DELETE && registeredDirectories.contains(eventPath.toAbsolutePath())) {
                                     continue;
                                 }
                                 emitEventExecution(eventPath, changeType, conditionContext, context, emitter);
@@ -399,6 +419,11 @@ public class RealtimeTrigger extends AbstractTrigger
                             // that could incorrectly suppress DELETE events for reused paths
                             registeredDirectories.remove(registeredDirectory.toAbsolutePath());
                         }
+                        // If all directories are gone, stop watching
+                        if (watchKeyMap.isEmpty()) {
+                            logger.info("All registered directories are no longer valid; terminating watcher");
+                            break;
+                        }
                     }
                 }
 
@@ -409,7 +434,8 @@ public class RealtimeTrigger extends AbstractTrigger
                 logger.error("RealtimeTrigger error: {}", e.getMessage(), e);
                 emitter.error(e);
             } finally {
-                cleanup();
+                ready.set(false);
+                cleanup(null, null);
             }
         }).doOnCancel(() -> {
             logger.info("RealtimeTrigger cancelled");
@@ -430,7 +456,7 @@ public class RealtimeTrigger extends AbstractTrigger
      */
     private void emitEventExecution(
         Path eventPath,
-        String changeType,
+        ChangeType changeType,
         ConditionContext conditionContext,
         TriggerContext context,
         FluxSink<Execution> emitter
@@ -439,7 +465,7 @@ public class RealtimeTrigger extends AbstractTrigger
             // For DELETE, the file no longer exists, so we can't read attributes
             // For CREATE/UPDATE, attempt to read to detect directory vs file
             BasicFileAttributes attrs = null;
-            if (!"DELETE".equals(changeType)) {
+            if (changeType != ChangeType.DELETE) {
                 try {
                     attrs = Files.readAttributes(eventPath, BasicFileAttributes.class);
                 } catch (NoSuchFileException e) {
@@ -528,9 +554,11 @@ public class RealtimeTrigger extends AbstractTrigger
      * Events monitored: ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE
      *
      * @param directory the directory to register
+     * @param map the map to store WatchKey -> Path associations
+     * @param dirs the set to track registered directories
      * @throws Exception if registration fails
      */
-    private void registerDirectory(Path directory) throws Exception {
+    private void registerDirectory(Path directory, Map<WatchKey, Path> map, Set<Path> dirs) throws Exception {
         WatchService svc = watchService.get();
         if (svc == null) {
             throw new IllegalStateException("WatchService not initialized");
@@ -541,8 +569,15 @@ public class RealtimeTrigger extends AbstractTrigger
             StandardWatchEventKinds.ENTRY_MODIFY,
             StandardWatchEventKinds.ENTRY_DELETE
         );
-        watchKeyMap.put(key, directory);
-        registeredDirectories.add(directory.toAbsolutePath());
+        
+        // Check if trigger was stopped during registration (race condition fix)
+        if (!active.get()) {
+            key.cancel();
+            throw new IllegalStateException("Trigger stopped during registration");
+        }
+        
+        map.put(key, directory);
+        dirs.add(directory.toAbsolutePath());
     }
 
     /**
@@ -554,16 +589,18 @@ public class RealtimeTrigger extends AbstractTrigger
      * disappearance is treated as a fatal error (handled by caller).
      *
      * @param root the root directory to walk
+     * @param map the map to store WatchKey -> Path associations
+     * @param dirs the set to track registered directories
      * @throws Exception if walking the root fails
      */
-    private void registerDirectoryTree(Path root) throws Exception {
+    private void registerDirectoryTree(Path root, Map<WatchKey, Path> map, Set<Path> dirs) throws Exception {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(root)) {
             for (Path entry : stream) {
                 if (Files.isDirectory(entry) && !Files.isSymbolicLink(entry)) {
                     try {
-                        registerDirectory(entry);
+                        registerDirectory(entry, map, dirs);
                         // Recursively register subdirectories
-                        registerDirectoryTree(entry);
+                        registerDirectoryTree(entry, map, dirs);
                     } catch (IOException e) {
                         // Child directory disappeared or became inaccessible during the walk.
                         // This is a race condition, not a startup failure. Skip and continue.
@@ -609,7 +646,7 @@ public class RealtimeTrigger extends AbstractTrigger
         }
     }
 
-    private void cleanup() {
+    private void cleanup(Map<WatchKey, Path> watchKeyMap, Set<Path> registeredDirectories) {
         // Atomically claim ownership of the WatchService.
         // getAndSet(null) ensures only one thread gets a non-null reference.
         WatchService svc = watchService.getAndSet(null);
@@ -628,6 +665,9 @@ public class RealtimeTrigger extends AbstractTrigger
             if (watchKeyMap != null) {
                 watchKeyMap.clear();
             }
+            if (registeredDirectories != null) {
+                registeredDirectories.clear();
+            }
         }
     }
 
@@ -638,7 +678,7 @@ public class RealtimeTrigger extends AbstractTrigger
         private final File file;
 
         @Schema(title = "The type of change that occurred (CREATE, UPDATE, DELETE)")
-        private final String changeType;
+        private final ChangeType changeType;
     }
 }
 
