@@ -199,12 +199,16 @@ class RealtimeTriggerSecurityTest {
                 return;
             }
 
-            // Give the watcher a moment to process the ENTRY_CREATE for the symlink
-            Thread.sleep(500);
+            // Wait for the watcher to process the ENTRY_CREATE for the symlink with bounded timeout
+            int maxWaitSeconds = 3;
+            long startTime = System.currentTimeMillis();
+            while (!trigger.isReady() && System.currentTimeMillis() - startTime < maxWaitSeconds * 1000) {
+                Thread.sleep(50);
+            }
 
-            // Now try to create a file inside the external directory (accessed via the symlink)
+            // Now try to create a file THROUGH the symlink (not directly to external dir)
             // The symlink should have been rejected, so this file should NOT be detected
-            Files.write(fileInExternalDir, "content".getBytes());
+            Files.write(symlinkInTempDir.resolve("file.txt"), "content".getBytes());
             System.out.println("✓ Created file in external directory: " + fileInExternalDir);
 
             // The existing watcher thread should have received no execution

@@ -759,7 +759,7 @@ class RealtimeTriggerTest {
 
             Thread watcherThread = new Thread(() -> {
                 try {
-                    Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
+                    var subscription = Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
                         .subscribeOn(Schedulers.boundedElastic())
                         // Collect all emissions for 5 seconds or until complete
                         .subscribe(
@@ -767,8 +767,12 @@ class RealtimeTriggerTest {
                             e -> watcherError[0] = e,
                             () -> System.out.println("✓ Watcher stream completed")
                         );
-                    // Keep the thread alive while watching
-                    Thread.sleep(5000);
+                    // Keep the thread alive while watching, with bounded timeout
+                    long startTime = System.currentTimeMillis();
+                    while (System.currentTimeMillis() - startTime < 5000 && !subscription.isDisposed()) {
+                        Thread.sleep(100);
+                    }
+                    subscription.dispose();
                 } catch (Exception e) {
                     System.err.println("✗ Watcher error: " + e.getMessage());
                 }
@@ -783,8 +787,11 @@ class RealtimeTriggerTest {
             Files.write(file1, "file1".getBytes());
             System.out.println("✓ Created file1.txt");
 
-            // Give watcher time to process
-            Thread.sleep(200);
+            // Wait for first event to be collected with bounded timeout
+            long waitStart = System.currentTimeMillis();
+            while (receivedExecutions.size() < 1 && System.currentTimeMillis() - waitStart < 3000) {
+                Thread.sleep(50);
+            }
 
             // Create second file (while watcher still running)
             Files.write(file2, "file2".getBytes());
@@ -801,6 +808,9 @@ class RealtimeTriggerTest {
             // Verify we received both executions from the single trigger instance
             assertThat("Should have received 2 executions from one trigger",
                 receivedExecutions.size(), greaterThanOrEqualTo(2));
+
+            // Verify no errors occurred during watching
+            assertThat("Watcher should not have encountered errors", watcherError[0], nullValue());
 
             // Verify first execution is for file1
             Execution firstExec = receivedExecutions.get(0);
