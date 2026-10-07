@@ -15,6 +15,7 @@ import lombok.experimental.SuperBuilder;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
 
 import java.nio.file.*;
 import java.io.IOException;
@@ -261,8 +262,18 @@ public class RealtimeTrigger extends AbstractTrigger
                 EventType renderedOn = runContext.render(this.on).as(EventType.class)
                     .orElse(EventType.CREATE_OR_UPDATE);
                 String renderedRegExp = null;
+                java.util.regex.Pattern compiledPattern = null;
                 if (this.regExp != null) {
                     renderedRegExp = runContext.render(this.regExp).as(String.class).orElse(null);
+                    if (renderedRegExp != null) {
+                        try {
+                            compiledPattern = java.util.regex.Pattern.compile(renderedRegExp);
+                        } catch (java.util.regex.PatternSyntaxException e) {
+                            throw new IllegalArgumentException(
+                                "Invalid regex pattern in 'regExp': " + renderedRegExp + " - " + e.getMessage(), e
+                            );
+                        }
+                    }
                 }
 
                 // Capture the WatchService reference once at the beginning to avoid null-dereference race with stop()
@@ -325,87 +336,22 @@ public class RealtimeTrigger extends AbstractTrigger
                                 continue;
                             }
 
-                            if (renderedRegExp != null && !matchesRegExp(eventPath, renderedRegExp)) {
+                            if (compiledPattern != null && !matchesRegExp(eventPath, compiledPattern)) {
                                 continue;
                             }
 
+                            // Process event based on type
+                            String changeType = null;
                             if (kind == StandardWatchEventKinds.ENTRY_CREATE) {
-                                try {
-                                    if (Files.isDirectory(eventPath)) {
-                                        continue;
-                                    }
-
-                                    BasicFileAttributes attrs = Files.readAttributes(eventPath, BasicFileAttributes.class);
-                                    File file = File.from(eventPath, attrs);
-
-                                    Output output = Output.builder()
-                                        .file(file)
-                                        .changeType("CREATE")
-                                        .build();
-
-                                    Execution execution = TriggerService.generateRealtimeExecution(
-                                        RealtimeTrigger.this,
-                                        conditionContext,
-                                        context,
-                                        output
-                                    );
-
-                                    emitter.next(execution);
-
-                                } catch (NoSuchFileException e) {
-                                    // Race: file was created but deleted before we could read it
-                                } catch (Exception e) {
-                                    logger.warn("Error processing CREATE event for {}: {}", eventPath, e.getMessage(), e);
-                                }
+                                changeType = "CREATE";
                             } else if (kind == StandardWatchEventKinds.ENTRY_MODIFY) {
-                                try {
-                                    if (Files.isDirectory(eventPath)) {
-                                        continue;
-                                    }
-
-                                    BasicFileAttributes attrs = Files.readAttributes(eventPath, BasicFileAttributes.class);
-                                    File file = File.from(eventPath, attrs);
-
-                                    Output output = Output.builder()
-                                        .file(file)
-                                        .changeType("UPDATE")
-                                        .build();
-
-                                    Execution execution = TriggerService.generateRealtimeExecution(
-                                        RealtimeTrigger.this,
-                                        conditionContext,
-                                        context,
-                                        output
-                                    );
-
-                                    emitter.next(execution);
-
-                                } catch (NoSuchFileException e) {
-                                    // Race: file was modified but deleted before we could read it
-                                } catch (Exception e) {
-                                    logger.warn("Error processing MODIFY event for {}: {}", eventPath, e.getMessage(), e);
-                                }
+                                changeType = "UPDATE";
                             } else if (kind == StandardWatchEventKinds.ENTRY_DELETE) {
-                                try {
-                                    File file = File.from(eventPath, null);
+                                changeType = "DELETE";
+                            }
 
-                                    Output output = Output.builder()
-                                        .file(file)
-                                        .changeType("DELETE")
-                                        .build();
-
-                                    Execution execution = TriggerService.generateRealtimeExecution(
-                                        RealtimeTrigger.this,
-                                        conditionContext,
-                                        context,
-                                        output
-                                    );
-
-                                    emitter.next(execution);
-
-                                } catch (Exception e) {
-                                    logger.warn("Error processing DELETE event for {}: {}", eventPath, e.getMessage(), e);
-                                }
+                            if (changeType != null) {
+                                emitEventExecution(eventPath, changeType, conditionContext, context, emitter);
                             }
 
                         } catch (Exception e) {
@@ -439,6 +385,65 @@ public class RealtimeTrigger extends AbstractTrigger
     }
 
     /**
+     * Emits an execution for a file event.
+     * Handles CREATE, UPDATE (MODIFY), and DELETE events.
+     * Skips directories—only file events produce executions.
+     *
+     * @param eventPath the file path that changed
+     * @param changeType the event type: CREATE, UPDATE, or DELETE
+     * @param conditionContext the trigger condition context
+     * @param context the trigger context
+     * @param emitter the flux emitter to emit executions to
+     */
+    private void emitEventExecution(
+        Path eventPath,
+        String changeType,
+        ConditionContext conditionContext,
+        TriggerContext context,
+        FluxSink<Execution> emitter
+    ) {
+        try {
+            // For DELETE, the file no longer exists, so we can't read attributes
+            // For CREATE/UPDATE, attempt to read to detect directory vs file
+            BasicFileAttributes attrs = null;
+            if (!"DELETE".equals(changeType)) {
+                try {
+                    attrs = Files.readAttributes(eventPath, BasicFileAttributes.class);
+                } catch (NoSuchFileException e) {
+                    // Race condition: file was deleted before we could read it
+                    logger.debug("File disappeared during {} event processing: {}", changeType, eventPath);
+                    return;
+                }
+
+                // Skip directories—only file events should emit executions
+                if (attrs != null && attrs.isDirectory()) {
+                    return;
+                }
+            }
+
+            // Create file metadata for the execution
+            File file = File.from(eventPath, attrs);
+
+            Output output = Output.builder()
+                .file(file)
+                .changeType(changeType)
+                .build();
+
+            Execution execution = TriggerService.generateRealtimeExecution(
+                this,
+                conditionContext,
+                context,
+                output
+            );
+
+            emitter.next(execution);
+
+        } catch (Exception e) {
+            logger.warn("Error processing {} event for {}: {}", changeType, eventPath, e.getMessage(), e);
+        }
+    }
+
+    /**
      * Determines whether a WatchEvent.Kind matches the configured EventType filter.
      * Maps WatchService StandardWatchEventKinds to EventType values.
      *
@@ -460,25 +465,19 @@ public class RealtimeTrigger extends AbstractTrigger
     }
 
     /**
-     * Tests whether a file path matches the configured regex pattern.
+     * Tests whether a file path matches the compiled regex pattern.
      * The pattern is applied against the full absolute path of the file.
      *
      * @param path the file path to test
-     * @param pattern the regex pattern (may be null)
+     * @param pattern the compiled regex pattern (may be null)
      * @return true if the pattern is null (no filter) or the path matches; false otherwise
      */
-    private boolean matchesRegExp(Path path, String pattern) {
+    private boolean matchesRegExp(Path path, java.util.regex.Pattern pattern) {
         if (pattern == null) {
             return true;
         }
-        try {
-            String pathStr = path.toString();
-            return pathStr.matches(pattern);
-        } catch (Exception e) {
-            logger.warn("Error matching regex pattern '{}' against path '{}': {}", 
-                pattern, path, e.getMessage());
-            return false;
-        }
+        String pathStr = path.toString();
+        return pattern.matcher(pathStr).matches();
     }
 
     /**
