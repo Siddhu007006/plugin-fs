@@ -42,7 +42,7 @@ import io.kestra.core.models.annotations.PluginProperty;
     description = """
         Watches a local directory for filesystem events (create, modify, delete) using Java NIO WatchService.
         Fires immediately when files matching the filter are detected, without polling.
-        
+
         Note: On macOS, WatchService uses a polling-based fallback and may not detect events as quickly as on Linux or Windows.
         """
 )
@@ -541,7 +541,7 @@ public class RealtimeTrigger extends AbstractTrigger
     /**
      * Recursively walks the directory tree and registers all subdirectories.
      * Called during startup when recursive: true.
-     * 
+     *
      * If a child directory disappears during the walk (race condition),
      * it is skipped and registration continues. Only the root directory
      * disappearance is treated as a fatal error (handled by caller).
@@ -617,7 +617,7 @@ public class RealtimeTrigger extends AbstractTrigger
         } finally {
             // Establish invariant: trigger is fully inactive
             active.set(false);
-            
+
             if (watchKeyMap != null) {
                 watchKeyMap.clear();
             }
@@ -634,3 +634,4 @@ public class RealtimeTrigger extends AbstractTrigger
         private final String changeType;
     }
 }
+
