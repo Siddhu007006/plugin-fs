@@ -19,6 +19,9 @@ import reactor.core.publisher.FluxSink;
 
 import java.nio.file.*;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.Map;
@@ -146,6 +149,7 @@ public class RealtimeTrigger extends AbstractTrigger
     private transient final AtomicReference<WatchService> watchService = new AtomicReference<>();
     private transient Logger logger;
     private transient Map<WatchKey, Path> watchKeyMap;
+    private transient Set<Path> registeredDirectories;  // Track directories to suppress DELETE events
 
     /**
      * Package-private readiness check for testing.
@@ -226,6 +230,7 @@ public class RealtimeTrigger extends AbstractTrigger
             try {
                 active.set(true);
                 watchKeyMap = new ConcurrentHashMap<>();
+                registeredDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
                 // Render and validate the `from` property
                 String renderedFrom = runContext.render(this.from).as(String.class)
@@ -242,10 +247,21 @@ public class RealtimeTrigger extends AbstractTrigger
                     throw new IllegalArgumentException("Path is not a directory: " + rootDirectory);
                 }
 
+                // Check cancellation before creating resources
+                if (!active.get()) {
+                    return;
+                }
+
                 logger.info("Watching directory: {}", rootDirectory);
 
                 // Create WatchService
                 createWatchService();
+
+                // Check cancellation after resource creation
+                if (!active.get()) {
+                    closeWatchService();
+                    return;
+                }
 
                 // Register root directory
                 registerDirectory(rootDirectory);
@@ -254,6 +270,12 @@ public class RealtimeTrigger extends AbstractTrigger
                 boolean rRecursive = runContext.render(this.recursive).as(Boolean.class).orElse(false);
                 if (rRecursive) {
                     registerDirectoryTree(rootDirectory);
+                }
+
+                // Check cancellation before entering event loop
+                if (!active.get()) {
+                    closeWatchService();
+                    return;
                 }
 
                 logger.info("RealtimeTrigger initialized with {} watch keys. Waiting for filesystem events", watchKeyMap.size());
@@ -320,9 +342,9 @@ public class RealtimeTrigger extends AbstractTrigger
 
                             if (kind == StandardWatchEventKinds.ENTRY_CREATE && rRecursive && Files.isDirectory(eventPath) && !Files.isSymbolicLink(eventPath)) {
                                 try {
-                                    // Security: We reject symlinks above (the actual attack vector).
-                                    // Non-symlink directories created dynamically inherit allowed-paths
-                                    // from their parent, so we don't need to re-validate them.
+                                    // Security note: Dynamically created directories are children of
+                                    // already-validated allowed paths, so they inherit the security property.
+                                    // We've already rejected symlinks above, so plain directories are safe.
                                     registerDirectory(eventPath);
                                     registerDirectoryTree(eventPath);
                                 } catch (IOException e) {
@@ -351,6 +373,10 @@ public class RealtimeTrigger extends AbstractTrigger
                             }
 
                             if (changeType != null) {
+                                // Skip DELETE events for registered directories (file-only trigger)
+                                if ("DELETE".equals(changeType) && registeredDirectories.contains(eventPath.toAbsolutePath())) {
+                                    continue;
+                                }
                                 emitEventExecution(eventPath, changeType, conditionContext, context, emitter);
                             }
 
@@ -509,6 +535,7 @@ public class RealtimeTrigger extends AbstractTrigger
             StandardWatchEventKinds.ENTRY_DELETE
         );
         watchKeyMap.put(key, directory);
+        registeredDirectories.add(directory.toAbsolutePath());
     }
 
     /**
