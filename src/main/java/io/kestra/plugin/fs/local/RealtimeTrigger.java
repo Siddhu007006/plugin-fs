@@ -26,7 +26,6 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -221,7 +220,7 @@ public class RealtimeTrigger extends AbstractTrigger
 
     @Override
     public Publisher<Execution> evaluate(ConditionContext conditionContext, TriggerContext context) throws Exception {
-        RunContext runContext = conditionContext.getRunContext();
+        final RunContext runContext = conditionContext.getRunContext();
         this.logger = runContext.logger();
 
         logger.info("RealtimeTrigger starting for directory: {}", this.from);
@@ -232,12 +231,29 @@ public class RealtimeTrigger extends AbstractTrigger
                 watchKeyMap = new ConcurrentHashMap<>();
                 registeredDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-                // Render and validate the `from` property
+                // Step 1: Render and validate the `from` property
                 String renderedFrom = runContext.render(this.from).as(String.class)
                     .orElseThrow(() -> new IllegalArgumentException("`from` is required"));
                 Path rootDirectory = Paths.get(renderedFrom).toAbsolutePath().normalize();
 
-                // Validate against allowed-paths configuration
+                // Step 2: Render and compile regex pattern BEFORE creating resources (fail-fast)
+                EventType renderedOn = runContext.render(this.on).as(EventType.class)
+                    .orElse(EventType.CREATE_OR_UPDATE);
+                java.util.regex.Pattern compiledPattern = null;
+                if (this.regExp != null) {
+                    String renderedRegExp = runContext.render(this.regExp).as(String.class).orElse(null);
+                    if (renderedRegExp != null) {
+                        try {
+                            compiledPattern = java.util.regex.Pattern.compile(renderedRegExp);
+                        } catch (java.util.regex.PatternSyntaxException e) {
+                            throw new IllegalArgumentException(
+                                "Invalid regex pattern in 'regExp': " + renderedRegExp + " - " + e.getMessage(), e
+                            );
+                        }
+                    }
+                }
+
+                // Step 3: Validate root directory against allowed-paths configuration
                 validatePath(rootDirectory, runContext);
 
                 if (!Files.exists(rootDirectory)) {
@@ -247,14 +263,14 @@ public class RealtimeTrigger extends AbstractTrigger
                     throw new IllegalArgumentException("Path is not a directory: " + rootDirectory);
                 }
 
-                // Check cancellation before creating resources
+                // Step 4: Check cancellation before creating resources
                 if (!active.get()) {
                     return;
                 }
 
                 logger.info("Watching directory: {}", rootDirectory);
 
-                // Create WatchService
+                // Step 5: Create WatchService
                 createWatchService();
 
                 // Check cancellation after resource creation
@@ -263,7 +279,7 @@ public class RealtimeTrigger extends AbstractTrigger
                     return;
                 }
 
-                // Register root directory
+                // Step 6: Register root directory
                 registerDirectory(rootDirectory);
 
                 // If recursive, walk and register all subdirectories
@@ -279,24 +295,6 @@ public class RealtimeTrigger extends AbstractTrigger
                 }
 
                 logger.info("RealtimeTrigger initialized with {} watch keys. Waiting for filesystem events", watchKeyMap.size());
-
-                // Render filter properties once before entering the event loop
-                EventType renderedOn = runContext.render(this.on).as(EventType.class)
-                    .orElse(EventType.CREATE_OR_UPDATE);
-                String renderedRegExp = null;
-                java.util.regex.Pattern compiledPattern = null;
-                if (this.regExp != null) {
-                    renderedRegExp = runContext.render(this.regExp).as(String.class).orElse(null);
-                    if (renderedRegExp != null) {
-                        try {
-                            compiledPattern = java.util.regex.Pattern.compile(renderedRegExp);
-                        } catch (java.util.regex.PatternSyntaxException e) {
-                            throw new IllegalArgumentException(
-                                "Invalid regex pattern in 'regExp': " + renderedRegExp + " - " + e.getMessage(), e
-                            );
-                        }
-                    }
-                }
 
                 // Capture the WatchService reference once at the beginning to avoid null-dereference race with stop()
                 WatchService service = watchService.get();
@@ -342,11 +340,15 @@ public class RealtimeTrigger extends AbstractTrigger
 
                             if (kind == StandardWatchEventKinds.ENTRY_CREATE && rRecursive && Files.isDirectory(eventPath) && !Files.isSymbolicLink(eventPath)) {
                                 try {
-                                    // Security note: Dynamically created directories are children of
-                                    // already-validated allowed paths, so they inherit the security property.
-                                    // We've already rejected symlinks above, so plain directories are safe.
+                                    // Dynamically created directories must be explicitly validated against
+                                    // allowed-paths to enforce consistent security policy.
+                                    validatePath(eventPath, runContext);
                                     registerDirectory(eventPath);
                                     registerDirectoryTree(eventPath);
+                                } catch (SecurityException e) {
+                                    // A newly created directory is outside allowed-paths. Skip it and continue watching.
+                                    logger.warn("Security: Rejecting dynamically created directory outside allowed-paths: {} - {}",
+                                        eventPath, e.getMessage());
                                 } catch (IOException e) {
                                     // Could not register newly created directory (may have been deleted)
                                     logger.debug("Could not register dynamically created directory {}: {}", eventPath, e.getMessage());
