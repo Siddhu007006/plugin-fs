@@ -44,10 +44,8 @@ class RealtimeTriggerSecurityTest {
 
     @Test
     @Timeout(15)
-    void testSecurityMissingAllowedPathsRejected() throws Exception {
-        // Test that trigger fails when allowed-paths is not configured.
-        // The test resource config allows /tmp and C:\Users, so we attempt
-        // to start a watcher on a path outside those boundaries and expect rejection.
+    void testSecurityPathRejectedWhenOutsideAllowedPaths() throws Exception {
+        // Test that paths outside the configured allowed-paths are rejected.
 
         Path outsideDir = null;
         try {
@@ -204,26 +202,20 @@ class RealtimeTriggerSecurityTest {
             // Give the watcher a moment to process the ENTRY_CREATE for the symlink
             Thread.sleep(500);
 
-            // Now try to create a file inside the external directory
+            // Now try to create a file inside the external directory (accessed via the symlink)
             // The symlink should have been rejected, so this file should NOT be detected
             Files.write(fileInExternalDir, "content".getBytes());
-            System.out.println("✓ Created file in external directory (via symlink path): " + fileInExternalDir);
+            System.out.println("✓ Created file in external directory: " + fileInExternalDir);
 
-            // Wait for execution with timeout
-            // Since the symlink was rejected, no execution should occur
-            receivedExecution[0] = Flux.from(
-                    trigger.evaluate(context.getKey(), context.getValue())
-                )
-                .subscribeOn(Schedulers.boundedElastic())
-                .blockFirst(Duration.ofSeconds(3));
-
+            // The existing watcher thread should have received no execution
+            // because the symlink was rejected during ENTRY_CREATE
             watcherThread.join(12000);
             if (watcherThread.isAlive()) {
                 trigger.stop();
                 watcherThread.join(2000);
             }
 
-            // Symlinks should be rejected - no execution should be received
+            // Symlinks should be rejected - no execution should be received from the watcher
             assertThat("Symlink should be rejected; file through symlink should not be detected",
                 receivedExecution[0], nullValue());
 

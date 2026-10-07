@@ -393,7 +393,12 @@ public class RealtimeTrigger extends AbstractTrigger
                     boolean valid = key.reset();
                     if (!valid) {
                         // Key is no longer valid (directory deleted, etc.)
-                        watchKeyMap.remove(key);
+                        Path registeredDirectory = watchKeyMap.remove(key);
+                        if (registeredDirectory != null) {
+                            // Also remove from registered directories to avoid stale entries
+                            // that could incorrectly suppress DELETE events for reused paths
+                            registeredDirectories.remove(registeredDirectory.toAbsolutePath());
+                        }
                     }
                 }
 

@@ -737,10 +737,11 @@ class RealtimeTriggerTest {
     @Test
     @Timeout(15)
     void testMultipleEventsInSequence() throws Exception {
-        // Test that ONE trigger instance can detect file events.
-        // Simplified version that demonstrates one watcher instance working correctly.
+        // Test that ONE trigger instance can detect multiple file events in sequence.
+        // This proves Issue #365 requirement: one execution per matched event from a single trigger.
         Path tempDir = Files.createTempDirectory("realtime-trigger-test");
         Path file1 = tempDir.resolve("file1.txt");
+        Path file2 = tempDir.resolve("file2.txt");
 
         try {
             RealtimeTrigger trigger = RealtimeTrigger.builder()
@@ -752,14 +753,22 @@ class RealtimeTriggerTest {
 
             var context = TestsUtils.mockTrigger(runContextFactory, trigger);
 
-            Execution[] receivedExecution = new Execution[1];
+            // Collect all executions from this single trigger
+            java.util.List<Execution> receivedExecutions = Collections.synchronizedList(new java.util.ArrayList<>());
+            Throwable[] watcherError = new Throwable[1];
+
             Thread watcherThread = new Thread(() -> {
                 try {
-                    receivedExecution[0] = Flux.from(
-                            trigger.evaluate(context.getKey(), context.getValue())
-                        )
+                    Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
                         .subscribeOn(Schedulers.boundedElastic())
-                        .blockFirst(Duration.ofSeconds(10));
+                        // Collect all emissions for 5 seconds or until complete
+                        .subscribe(
+                            receivedExecutions::add,
+                            e -> watcherError[0] = e,
+                            () -> System.out.println("✓ Watcher stream completed")
+                        );
+                    // Keep the thread alive while watching
+                    Thread.sleep(5000);
                 } catch (Exception e) {
                     System.err.println("✗ Watcher error: " + e.getMessage());
                 }
@@ -774,26 +783,44 @@ class RealtimeTriggerTest {
             Files.write(file1, "file1".getBytes());
             System.out.println("✓ Created file1.txt");
 
-            // Wait for execution
-            watcherThread.join(12000);
+            // Give watcher time to process
+            Thread.sleep(200);
+
+            // Create second file (while watcher still running)
+            Files.write(file2, "file2".getBytes());
+            System.out.println("✓ Created file2.txt");
+
+            // Wait for watcher to finish collection
+            watcherThread.join(6000);
 
             if (watcherThread.isAlive()) {
                 trigger.stop();
                 watcherThread.join(2000);
             }
 
-            assertThat("Should have triggered for file1", receivedExecution[0], notNullValue());
-            Map<String, Object> vars = receivedExecution[0].getTrigger().getVariables();
-            @SuppressWarnings("unchecked")
-            Map<String, Object> fileVars = (Map<String, Object>) vars.get("file");
-            assertThat("Trigger should be for file1.txt", fileVars.get("name"), equalTo("file1.txt"));
+            // Verify we received both executions from the single trigger instance
+            assertThat("Should have received 2 executions from one trigger",
+                receivedExecutions.size(), greaterThanOrEqualTo(2));
 
-            System.out.println("✓ Execution detected: file1.txt");
-            System.out.println("\n✓ Multiple Events in Sequence Test Passed:");
-            System.out.println("  One trigger instance detected file creation event");
+            // Verify first execution is for file1
+            Execution firstExec = receivedExecutions.get(0);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> firstFile = (Map<String, Object>) firstExec.getTrigger().getVariables().get("file");
+            assertThat("First execution should be for file1.txt", firstFile.get("name"), equalTo("file1.txt"));
+
+            // Verify second execution is for file2
+            Execution secondExec = receivedExecutions.get(1);
+            @SuppressWarnings("unchecked")
+            Map<String, Object> secondFile = (Map<String, Object>) secondExec.getTrigger().getVariables().get("file");
+            assertThat("Second execution should be for file2.txt", secondFile.get("name"), equalTo("file2.txt"));
+
+            System.out.println("✓ Multiple Events in Sequence Test Passed:");
+            System.out.println("  One trigger instance detected " + receivedExecutions.size() + " file creation events");
+            System.out.println("  Events received in correct order: file1.txt → file2.txt");
 
         } finally {
             Files.deleteIfExists(file1);
+            Files.deleteIfExists(file2);
             Files.deleteIfExists(tempDir);
         }
     }
@@ -998,6 +1025,9 @@ class RealtimeTriggerTest {
             watcherThread.join(5000);
             assertThat("Watcher thread should complete after kill()",
                 watcherThread.isAlive(), is(false));
+
+            // Give a bit of time for the ready flag to be cleared
+            Thread.sleep(100);
 
             // After kill(), isReady() should return false
             assertThat("Trigger should not be ready after kill()",
