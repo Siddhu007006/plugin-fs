@@ -11,15 +11,11 @@ import org.junit.jupiter.api.Timeout;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CancellationException;
 
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -364,6 +360,73 @@ class RealtimeTriggerTest {
         } finally {
             // Cleanup (file may already be deleted)
             Files.deleteIfExists(testFile);
+            Files.deleteIfExists(tempDir);
+        }
+    }
+
+    @Test
+    @Timeout(15)
+    void testDeleteDirectoryDoesNotEmitExecution() throws Exception {
+        // Test that deleting a child directory with recursive=false does NOT emit an execution.
+        // Only file deletions should emit executions; directory deletions should be suppressed.
+        Path tempDir = Files.createTempDirectory("realtime-trigger-test");
+        Path childDir = tempDir.resolve("subdir");
+
+        try {
+            // Create child directory before trigger starts
+            Files.createDirectory(childDir);
+            System.out.println("✓ Child directory created before trigger: " + childDir);
+
+            // Create the realtime trigger watching for DELETE events with recursive=false
+            RealtimeTrigger trigger = RealtimeTrigger.builder()
+                .id("test-realtime-delete-dir")
+                .type(RealtimeTrigger.class.getName())
+                .from(Property.ofValue(tempDir.toString()))
+                .on(Property.ofValue(RealtimeTrigger.EventType.DELETE))
+                .recursive(Property.ofValue(false))
+                .build();
+
+            var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+
+            Execution[] receivedExecution = new Execution[1];
+            Thread watcherThread = new Thread(() -> {
+                try {
+                    receivedExecution[0] = Flux.from(
+                            trigger.evaluate(context.getKey(), context.getValue())
+                        )
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .blockFirst(Duration.ofSeconds(10));
+                } catch (Exception e) {
+                    System.err.println("✗ Watcher error: " + e.getMessage());
+                }
+            });
+
+            watcherThread.setName("RealtimeTrigger-DeleteDir-Test");
+            watcherThread.start();
+
+            waitForWatcherReady(trigger, 5);
+
+            // Delete the child directory
+            Files.deleteIfExists(childDir);
+            System.out.println("✓ Child directory deleted: " + childDir);
+
+            // Wait for potential execution
+            watcherThread.join(5000);
+
+            if (watcherThread.isAlive()) {
+                trigger.stop();
+                watcherThread.join(2000);
+            }
+
+            // Verify NO execution was received (directories should be suppressed)
+            assertThat("Directory deletion should not emit execution", receivedExecution[0], nullValue());
+
+            System.out.println("\n✓ DELETE Directory Suppression Test Passed:");
+            System.out.println("  Child directory deletion did not emit execution");
+            System.out.println("  Only file deletions emit executions (consistent with polling trigger)");
+
+        } finally {
+            Files.deleteIfExists(childDir);
             Files.deleteIfExists(tempDir);
         }
     }

@@ -2,6 +2,7 @@ package io.kestra.plugin.fs.local;
 
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
+import io.kestra.core.models.annotations.PluginProperty;
 import io.kestra.core.models.conditions.ConditionContext;
 import io.kestra.core.models.executions.Execution;
 import io.kestra.core.models.property.Property;
@@ -17,19 +18,18 @@ import org.slf4j.Logger;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
 
-import java.nio.file.*;
 import java.io.IOException;
-import java.util.Collections;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
-import io.kestra.core.models.annotations.PluginProperty;
 
 @SuperBuilder
 @ToString
@@ -178,8 +178,7 @@ public class RealtimeTrigger extends AbstractTrigger
             throw new SecurityException(
                 "The 'allowed-paths' configuration is required to enable access to the local filesystem. " +
                 "You must define at least one allowed path in the plugin configuration, `kestra.plugins.configurations`. " +
-                "Example: kestra.plugins.configurations[io.kestra.plugin.fs.local.RealtimeTrigger].allowed-paths: [\"/data/incoming\"] " +
-                "Refer to: https://kestra.io/docs/configuration#set-default-values"
+                "Refer to the example in the plugin documentation."
             );
         }
 
@@ -191,14 +190,29 @@ public class RealtimeTrigger extends AbstractTrigger
      * Matches AbstractLocalTask.validatePath() for consistent security policy.
      * Throws SecurityException if the path is not allowed or if allowed-paths is not configured.
      */
-    private void validatePath(Path path, RunContext runContext) throws IOException {
+    private void validatePath(Path path, RunContext runContext) {
         List<String> renderedAllowedPaths = getAllowedPaths(runContext);
 
         Path realPath;
         try {
-            realPath = path.toRealPath();
+            if (path.toFile().exists()) {
+                realPath = path.toRealPath();
+            } else {
+                Path absolute = path.toAbsolutePath().normalize();
+                Path ancestor = absolute;
+                Path suffix = Path.of("");
+                while (ancestor != null && !ancestor.toFile().exists()) {
+                    suffix = ancestor.getFileName() == null ? suffix : ancestor.getFileName().resolve(suffix);
+                    ancestor = ancestor.getParent();
+                }
+                if (ancestor != null) {
+                    realPath = ancestor.toRealPath().resolve(suffix);
+                } else {
+                    realPath = absolute;
+                }
+            }
         } catch (IOException e) {
-            realPath = path.toAbsolutePath().normalize();
+            throw new IllegalArgumentException("Invalid path: " + path + ". Error: " + e.getMessage(), e);
         }
 
         List<Path> normalizedAllowedPaths = renderedAllowedPaths.stream()
@@ -234,11 +248,21 @@ public class RealtimeTrigger extends AbstractTrigger
         logger.info("RealtimeTrigger starting for directory: {}", this.from);
 
         return Flux.<Execution>create(emitter -> {
+            Map<WatchKey, Path> watchKeyMap = new ConcurrentHashMap<>();
+            Set<Path> registeredDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
+            Set<Path> knownDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
+            emitter.onDispose(() -> {
+                logger.info("RealtimeTrigger disposed");
+                stop();
+            });
+
             try {
                 active.set(true);
-                // watchKeyMap and registeredDirectories are now local variables (subscription-local, not instance state)
-                Map<WatchKey, Path> watchKeyMap = new ConcurrentHashMap<>();
-                Set<Path> registeredDirectories = Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+                if (emitter.isCancelled()) {
+                    stop();
+                    return;
+                }
 
                 // Step 1: Render and validate the `from` property
                 String renderedFrom = runContext.render(this.from).as(String.class)
@@ -274,6 +298,7 @@ public class RealtimeTrigger extends AbstractTrigger
 
                 // Step 4: Check cancellation before creating resources
                 if (!active.get()) {
+                    emitter.complete();
                     return;
                 }
 
@@ -284,24 +309,48 @@ public class RealtimeTrigger extends AbstractTrigger
 
                 // Check cancellation after resource creation
                 if (!active.get()) {
-                    closeWatchService();
+                    emitter.complete();
                     return;
                 }
 
                 // Step 6: Register root directory
                 registerDirectory(rootDirectory, watchKeyMap, registeredDirectories);
-                ready.set(true);
+                knownDirectories.add(rootDirectory.toAbsolutePath());
 
-                // If recursive, walk and register all subdirectories
-                boolean rRecursive = runContext.render(this.recursive).as(Boolean.class).orElse(false);
+                boolean rRecursive = runContext.render(this.recursive)
+                    .as(Boolean.class)
+                    .orElse(false);
+
                 if (rRecursive) {
                     registerDirectoryTree(rootDirectory, watchKeyMap, registeredDirectories);
+                    // Add all registered directories to knownDirectories
+                    knownDirectories.addAll(registeredDirectories);
+                } else {
+                    // For non-recursive mode, track immediate child directories (pre-existing)
+                    // so DELETE events for them can be suppressed
+                    try (var stream = Files.list(rootDirectory)) {
+                        stream.filter(p -> {
+                            try {
+                                return Files.isDirectory(p) && !Files.isSymbolicLink(p);
+                            } catch (Exception e) {
+                                return false;
+                            }
+                        }).forEach(childDir -> knownDirectories.add(childDir.toAbsolutePath()));
+                    } catch (IOException e) {
+                        logger.debug("Could not list child directories for tracking: {}", e.getMessage());
+                    }
                 }
+
+                if (!active.get()) {
+                    emitter.complete();
+                    return;
+                }
+
+                ready.set(true);
 
                 // Check cancellation before entering event loop
                 if (!active.get()) {
-                    closeWatchService();
-                    cleanup(watchKeyMap, registeredDirectories);
+                    emitter.complete();
                     return;
                 }
 
@@ -351,20 +400,37 @@ public class RealtimeTrigger extends AbstractTrigger
 
                             if (kind == StandardWatchEventKinds.ENTRY_CREATE && rRecursive && Files.isDirectory(eventPath) && !Files.isSymbolicLink(eventPath)) {
                                 try {
-                                    // Dynamically created directories must be explicitly validated against
-                                    // allowed-paths to enforce consistent security policy.
                                     validatePath(eventPath, runContext);
                                     registerDirectory(eventPath, watchKeyMap, registeredDirectories);
                                     registerDirectoryTree(eventPath, watchKeyMap, registeredDirectories);
+                                    // Track this directory so DELETE events for it can be suppressed
+                                    knownDirectories.add(eventPath.toAbsolutePath());
                                 } catch (SecurityException e) {
-                                    // A newly created directory is outside allowed-paths. Skip it and continue watching.
-                                    logger.warn("Security: Rejecting dynamically created directory outside allowed-paths: {} - {}",
-                                        eventPath, e.getMessage());
+                                    logger.warn(
+                                        "Security: Rejecting dynamically created directory outside allowed-paths: {} - {}",
+                                        eventPath,
+                                        e.getMessage()
+                                    );
+                                } catch (IllegalArgumentException e) {
+                                    logger.warn(
+                                        "Could not validate dynamically created directory {}: {}",
+                                        eventPath,
+                                        e.getMessage()
+                                    );
                                 } catch (IOException e) {
-                                    // Could not register newly created directory (may have been deleted)
-                                    logger.debug("Could not register dynamically created directory {}: {}", eventPath, e.getMessage());
+                                    logger.debug(
+                                        "Could not register dynamically created directory {}: {}",
+                                        eventPath,
+                                        e.getMessage()
+                                    );
                                 }
                                 continue;
+                            }
+
+                            // Track directories for non-recursive mode (ENTRY_CREATE for child directories)
+                            if (kind == StandardWatchEventKinds.ENTRY_CREATE && !rRecursive && Files.exists(eventPath) && Files.isDirectory(eventPath) && !Files.isSymbolicLink(eventPath)) {
+                                knownDirectories.add(eventPath.toAbsolutePath());
+                                continue; // Don't emit CREATE events for directories
                             }
 
                             if (!shouldTrigger(kind, renderedOn)) {
@@ -375,12 +441,20 @@ public class RealtimeTrigger extends AbstractTrigger
                                 continue;
                             }
 
+                            if (Files.isSymbolicLink(eventPath)) {
+                                logger.warn("Security: Rejecting symbolic link event: {}", eventPath);
+                                continue;
+                            }
+
                             // Security: Validate event path against allowed-paths before emission
                             try {
                                 validatePath(eventPath, runContext);
-                            } catch (SecurityException | IOException e) {
-                                logger.warn("Security: Rejecting event for path outside allowed-paths: {} - {}",
-                                    eventPath, e.getMessage());
+                            } catch (SecurityException | IllegalArgumentException e) {
+                                logger.warn(
+                                    "Security: Rejecting event for path outside allowed-paths: {} - {}",
+                                    eventPath,
+                                    e.getMessage()
+                                );
                                 continue;
                             }
 
@@ -395,8 +469,11 @@ public class RealtimeTrigger extends AbstractTrigger
                             }
 
                             if (changeType != null) {
-                                // Skip DELETE events for registered directories (file-only trigger)
-                                if (changeType == ChangeType.DELETE && registeredDirectories.contains(eventPath.toAbsolutePath())) {
+                                // Skip DELETE events for known directories (file-only trigger)
+                                // Use knownDirectories instead of registeredDirectories to handle both
+                                // registered (recursive) and unregistered (non-recursive child dirs)
+                                if (changeType == ChangeType.DELETE && knownDirectories.contains(eventPath.toAbsolutePath())) {
+                                    knownDirectories.remove(eventPath.toAbsolutePath());
                                     continue;
                                 }
                                 emitEventExecution(eventPath, changeType, conditionContext, context, emitter);
@@ -431,15 +508,16 @@ public class RealtimeTrigger extends AbstractTrigger
 
                 emitter.complete();
             } catch (Exception e) {
-                logger.error("RealtimeTrigger error: {}", e.getMessage(), e);
-                emitter.error(e);
+                if (active.get()) {
+                    logger.error("RealtimeTrigger error: {}", e.getMessage(), e);
+                    emitter.error(e);
+                } else {
+                    logger.debug("RealtimeTrigger stopped during initialization or event processing: {}", e.getMessage());
+                    emitter.complete();
+                }
             } finally {
-                ready.set(false);
-                cleanup(null, null);
+                cleanup(watchKeyMap, registeredDirectories);
             }
-        }).doOnCancel(() -> {
-            logger.info("RealtimeTrigger cancelled");
-            stop();
         });
     }
 
@@ -465,23 +543,38 @@ public class RealtimeTrigger extends AbstractTrigger
             // For DELETE, the file no longer exists, so we can't read attributes
             // For CREATE/UPDATE, attempt to read to detect directory vs file
             BasicFileAttributes attrs = null;
+
             if (changeType != ChangeType.DELETE) {
                 try {
                     attrs = Files.readAttributes(eventPath, BasicFileAttributes.class);
                 } catch (NoSuchFileException e) {
-                    // Race condition: file was deleted before we could read it
-                    logger.debug("File disappeared during {} event processing: {}", changeType, eventPath);
+                    logger.debug("File disappeared during {} event processing: {}",             changeType, eventPath);
                     return;
                 }
 
-                // Skip directories—only file events should emit executions
-                if (attrs != null && attrs.isDirectory()) {
+                if (attrs.isDirectory()) {
                     return;
                 }
             }
 
             // Create file metadata for the execution
-            File file = File.from(eventPath, attrs);
+            File file;
+
+            if (changeType == ChangeType.DELETE) {
+                file = File.builder()
+                    .uri(eventPath.toUri())
+                    .localPath(eventPath.toAbsolutePath().normalize())
+                    .name(eventPath.getFileName().toString())
+                    .parent(eventPath.getParent().toString())
+                    .size(null)
+                    .createdDate(null)
+                    .modifiedDate(null)
+                    .accessedDate(null)
+                    .isDirectory(false)
+                    .build();
+            } else {
+                file = File.from(eventPath, attrs);
+            }
 
             Output output = Output.builder()
                 .file(file)
@@ -569,13 +662,13 @@ public class RealtimeTrigger extends AbstractTrigger
             StandardWatchEventKinds.ENTRY_MODIFY,
             StandardWatchEventKinds.ENTRY_DELETE
         );
-        
+
         // Check if trigger was stopped during registration (race condition fix)
         if (!active.get()) {
             key.cancel();
             throw new IllegalStateException("Trigger stopped during registration");
         }
-        
+
         map.put(key, directory);
         dirs.add(directory.toAbsolutePath());
     }
@@ -661,6 +754,7 @@ public class RealtimeTrigger extends AbstractTrigger
         } finally {
             // Establish invariant: trigger is fully inactive
             active.set(false);
+            ready.set(false);
 
             if (watchKeyMap != null) {
                 watchKeyMap.clear();
@@ -681,4 +775,3 @@ public class RealtimeTrigger extends AbstractTrigger
         private final ChangeType changeType;
     }
 }
-
