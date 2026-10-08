@@ -403,8 +403,8 @@ public class RealtimeTrigger extends AbstractTrigger
                                     validatePath(eventPath, runContext);
                                     registerDirectory(eventPath, watchKeyMap, registeredDirectories);
                                     registerDirectoryTree(eventPath, watchKeyMap, registeredDirectories);
-                                    // Track this directory so DELETE events for it can be suppressed
-                                    knownDirectories.add(eventPath.toAbsolutePath());
+                                    // Track all newly registered directories (including nested) so DELETE events can be suppressed
+                                    knownDirectories.addAll(registeredDirectories);
                                 } catch (SecurityException e) {
                                     logger.warn(
                                         "Security: Rejecting dynamically created directory outside allowed-paths: {} - {}",

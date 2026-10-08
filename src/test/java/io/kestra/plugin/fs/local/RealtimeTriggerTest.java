@@ -433,6 +433,82 @@ class RealtimeTriggerTest {
 
     @Test
     @Timeout(15)
+    void testDeleteNestedDirectoryDoesNotEmitExecution() throws Exception {
+        // Regression test: With recursive=true, dynamically created nested directories
+        // should be tracked in knownDirectories so their deletion doesn't emit execution.
+        Path tempDir = Files.createTempDirectory("realtime-trigger-test");
+
+        try {
+            // Create the realtime trigger watching for DELETE events with recursive=true
+            RealtimeTrigger trigger = RealtimeTrigger.builder()
+                .id("test-realtime-delete-nested-dir")
+                .type(RealtimeTrigger.class.getName())
+                .from(Property.ofValue(tempDir.toString()))
+                .on(Property.ofValue(RealtimeTrigger.EventType.DELETE))
+                .recursive(Property.ofValue(true))
+                .build();
+
+            var context = TestsUtils.mockTrigger(runContextFactory, trigger);
+
+            java.util.List<Execution> receivedExecutions = Collections.synchronizedList(new java.util.ArrayList<>());
+            Thread watcherThread = new Thread(() -> {
+                try {
+                    Flux.from(trigger.evaluate(context.getKey(), context.getValue()))
+                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribe(receivedExecutions::add);
+                    // Keep thread alive for test duration
+                    Thread.sleep(10000);
+                } catch (Exception e) {
+                    System.err.println("✗ Watcher error: " + e.getMessage());
+                }
+            });
+
+            watcherThread.setName("RealtimeTrigger-DeleteNestedDir-Test");
+            watcherThread.start();
+
+            waitForWatcherReady(trigger, 5);
+
+            // Create nested directory structure
+            Path newDir = tempDir.resolve("new");
+            Path nestedDir = newDir.resolve("nested");
+            Files.createDirectories(nestedDir);
+            System.out.println("✓ Created nested directory: " + nestedDir);
+
+            // Wait for registration
+            Thread.sleep(500);
+
+            // Delete the nested directory
+            Files.deleteIfExists(nestedDir);
+            System.out.println("✓ Deleted nested directory: " + nestedDir);
+
+            // Wait to ensure no execution is emitted
+            Thread.sleep(2000);
+
+            trigger.stop();
+            watcherThread.join(2000);
+
+            // Verify NO execution was received (nested directory deletion should be suppressed)
+            assertThat("Nested directory deletion should not emit execution",
+                receivedExecutions.size(), equalTo(0));
+
+            System.out.println("\n✓ DELETE Nested Directory Suppression Test Passed:");
+            System.out.println("  Dynamically created nested directory deletion did not emit execution");
+            System.out.println("  knownDirectories correctly tracks all registered directories");
+
+        } finally {
+            // Cleanup (directories may already be deleted)
+            java.nio.file.Files.walk(tempDir)
+                .sorted(java.util.Comparator.reverseOrder())
+                .forEach(path -> {
+                    try {
+                        Files.deleteIfExists(path);
+                    } catch (Exception ignored) {}
+                });
+        }
+    }
+
+    @Test
+    @Timeout(15)
     void testRegexFilter() throws Exception {
         // Setup: Create a temporary directory
         Path tempDir = Files.createTempDirectory("realtime-trigger-test");
